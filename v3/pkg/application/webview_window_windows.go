@@ -38,6 +38,8 @@ var edgeMap = map[string]uintptr{
 	"nw-resize": w32.HTTOPLEFT,
 }
 
+const wmRestoreWebViewFocusAfterActivate = w32.WM_APP + 2049
+
 type windowsWebviewWindow struct {
 	requestCancellation      *windowsRequestCancellation
 	windowImpl               unsafe.Pointer
@@ -1699,6 +1701,16 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 			getNativeApplication().currentWindowID = w.parent.id
 			w.parent.emit(events.Windows.WindowClickActive)
 		}
+		if int(wparam&0xffff) != w32.WA_INACTIVE {
+			hwnd := w.hwnd
+			// WM_SETFOCUS restores keyboard focus synchronously, but WebView2 can
+			// leave its TSF caret geometry stale shortly after an Alt+Tab restore.
+			// Re-enter the controller from the window thread after activation has
+			// settled so IME composition UI keeps using the focused caret bounds.
+			time.AfterFunc(100*time.Millisecond, func() {
+				w32.PostMessage(hwnd, wmRestoreWebViewFocusAfterActivate, 0, 0)
+			})
+		}
 		// If we want to have a frameless window but with the default frame decorations, extend the DWM client area.
 		// This Option is not affected by returning 0 in WM_NCCALCSIZE.
 		// As a result we have hidden the titlebar but still have the default window frame styling.
@@ -1762,6 +1774,14 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 	case w32.WM_SETFOCUS:
 		w.focus()
 		w.parent.emit(events.Windows.WindowSetFocus)
+	case wmRestoreWebViewFocusAfterActivate:
+		if w.isActive() && w.chromium != nil && w.chromium.IsReady() {
+			w.focusingChromium = true
+			w.chromium.Focus()
+			w.focusingChromium = false
+			_ = w.chromium.NotifyParentWindowPositionChanged()
+		}
+		return 0
 	case w32.WM_MOVE, w32.WM_MOVING:
 		_ = w.chromium.NotifyParentWindowPositionChanged()
 		w.moveDebouncer(func() {
