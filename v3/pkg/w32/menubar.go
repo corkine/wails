@@ -276,6 +276,9 @@ var (
 // that MenuBarWndProc contains a failure.
 var menuBarImpl = menuBarWndProc
 
+// Default-procedure seam for regression tests of the handled/result contract.
+var menuBarDefaultProc = DefWindowProc
+
 // MenuBarWndProc draws the themed menu bar. It runs inside the window
 // procedure, where a panic would take the whole app down (#6311), so any
 // failure here is contained and the message is left to Windows' default
@@ -566,7 +569,7 @@ func menuBarWndProc(hwnd HWND, msg uint32, wParam WPARAM, lParam LPARAM, theme *
 	case WM_UAHMEASUREMENUITEM:
 		// Let the default window procedure handle the menu item measurement
 		// We're not modifying the default sizing anymore
-		result := DefWindowProc(hwnd, msg, wParam, lParam)
+		result := menuBarDefaultProc(hwnd, msg, wParam, lParam)
 
 		return true, result
 	case WM_NCPAINT:
@@ -574,14 +577,14 @@ func menuBarWndProc(hwnd HWND, msg uint32, wParam WPARAM, lParam LPARAM, theme *
 		paintDarkMenuBar(hwnd, theme)
 
 		// Then let Windows do its default painting
-		result := DefWindowProc(hwnd, msg, wParam, lParam)
+		result := menuBarDefaultProc(hwnd, msg, wParam, lParam)
 
 		// Paint again to ensure our painting is on top
 		paintDarkMenuBar(hwnd, theme)
 
 		return true, result
 	case WM_NCACTIVATE:
-		result := DefWindowProc(hwnd, msg, wParam, lParam)
+		result := menuBarDefaultProc(hwnd, msg, wParam, lParam)
 
 		// Force paint the menubar with dark background
 		paintDarkMenuBar(hwnd, theme)
@@ -589,15 +592,22 @@ func menuBarWndProc(hwnd HWND, msg uint32, wParam WPARAM, lParam LPARAM, theme *
 		return false, result
 	case WM_PAINT:
 		// Let Windows paint first
-		result := DefWindowProc(hwnd, msg, wParam, lParam)
+		result := menuBarDefaultProc(hwnd, msg, wParam, lParam)
 
 		// Then paint our menubar
 		paintDarkMenuBar(hwnd, theme)
 
 		return false, result
-	case WM_ACTIVATEAPP, WM_ACTIVATE:
+	case WM_ACTIVATE:
+		// The application WndProc still needs to emit activation events and
+		// schedule IME compensation. Leave default handling to that caller:
+		// calling DefWindowProc here and returning false would set host focus
+		// twice, pulling it back out of WebView between the two calls.
+		paintDarkMenuBar(hwnd, theme)
+		return false, 0
+	case WM_ACTIVATEAPP:
 		// Handle app activation/deactivation
-		result := DefWindowProc(hwnd, msg, wParam, lParam)
+		result := menuBarDefaultProc(hwnd, msg, wParam, lParam)
 
 		// Repaint menubar
 		paintDarkMenuBar(hwnd, theme)
@@ -605,7 +615,7 @@ func menuBarWndProc(hwnd HWND, msg uint32, wParam WPARAM, lParam LPARAM, theme *
 		return false, result
 	case WM_SIZE, WM_WINDOWPOSCHANGED:
 		// Handle window size changes
-		result := DefWindowProc(hwnd, msg, wParam, lParam)
+		result := menuBarDefaultProc(hwnd, msg, wParam, lParam)
 
 		// Repaint menubar after size change
 		paintDarkMenuBar(hwnd, theme)
@@ -630,7 +640,7 @@ func menuBarWndProc(hwnd HWND, msg uint32, wParam WPARAM, lParam LPARAM, theme *
 		return false, result
 	case WM_SETFOCUS, WM_KILLFOCUS:
 		// Handle focus changes (e.g., when inspector opens)
-		result := DefWindowProc(hwnd, msg, wParam, lParam)
+		result := menuBarDefaultProc(hwnd, msg, wParam, lParam)
 
 		// Repaint menubar after focus change
 		paintDarkMenuBar(hwnd, theme)
