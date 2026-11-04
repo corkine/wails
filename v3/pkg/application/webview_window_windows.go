@@ -89,6 +89,7 @@ type windowsWebviewWindow struct {
 
 	focusingChromium bool
 	onceDo           sync.Once
+	imeMoveFocus     imeMoveFocusState
 
 	// Window move debouncer
 	moveDebouncer func(func())
@@ -1029,7 +1030,7 @@ func (w *windowsWebviewWindow) unminimise() {
 func (w *windowsWebviewWindow) maximise() {
 	w32.ShowWindow(w.hwnd, w32.SW_MAXIMIZE)
 	if w.chromium.GetController() != nil {
-		w.chromium.Focus()
+		w.focusChromiumForIME()
 	}
 }
 
@@ -1041,7 +1042,7 @@ func (w *windowsWebviewWindow) unmaximise() {
 func (w *windowsWebviewWindow) restore() {
 	w32.ShowWindow(w.hwnd, w32.SW_RESTORE)
 	if w.chromium.GetController() != nil {
-		w.chromium.Focus()
+		w.focusChromiumForIME()
 	}
 	w.enforceMinSizeConstraints()
 }
@@ -1111,7 +1112,7 @@ func (w *windowsWebviewWindow) fullscreen() {
 	w32.SetMenu(w.hwnd, 0)
 
 	if w.chromium.GetController() != nil {
-		w.chromium.Focus()
+		w.focusChromiumForIME()
 	}
 	w.parent.emit(events.Windows.WindowFullscreen)
 }
@@ -1174,7 +1175,35 @@ func (w *windowsWebviewWindow) isVisible() bool {
 	return style&w32.WS_VISIBLE != 0
 }
 
+// focusChromiumForIME covers all host-initiated Focus calls, including window
+// restore/maximise paths that can run inside a native move/size loop.
+func (w *windowsWebviewWindow) focusChromiumForIME() {
+	if w.imeMoveFocus.moving {
+		return
+	}
+	if w.chromium == nil || !w.chromium.IsReady() {
+		return
+	}
+	w.chromium.Focus()
+}
+
+func (w *windowsWebviewWindow) restoreIMEAfterMove() {
+	if !w.isActive() || w.isDisabled() || w.isMinimised() {
+		return
+	}
+	if w.chromium == nil || !w.chromium.IsReady() {
+		return
+	}
+	_ = w.chromium.NotifyParentWindowPositionChanged()
+	w.focusingChromium = true
+	defer func() { w.focusingChromium = false }()
+	w.focusChromiumForIME()
+}
+
 func (w *windowsWebviewWindow) focus() {
+	if w.imeMoveFocus.moving {
+		return
+	}
 	w32.SetForegroundWindow(w.hwnd)
 
 	if w.isDisabled() {
@@ -1193,7 +1222,7 @@ func (w *windowsWebviewWindow) focus() {
 	}
 
 	w.focusingChromium = true
-	w.chromium.Focus()
+	w.focusChromiumForIME()
 	w.focusingChromium = false
 }
 
@@ -1710,11 +1739,12 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 		}
 		if int(wparam&0xffff) != w32.WA_INACTIVE {
 			hwnd := w.hwnd
+			epoch := w.imeMoveFocus.epoch
 			// Preserve the beta.26-toolbox.1 IME path: WM_SETFOCUS restores keyboard
 			// focus, then re-enter the controller after WebView2 and TSF observe
 			// activation. Do not also move controller focus inside WM_ACTIVATE.
 			time.AfterFunc(100*time.Millisecond, func() {
-				w32.PostMessage(hwnd, wmRestoreWebViewFocusAfterActivate, 0, 0)
+				w32.PostMessage(hwnd, wmRestoreWebViewFocusAfterActivate, epoch, 0)
 			})
 		}
 		// If we want to have a frameless window but with the default frame decorations, extend the DWM client area.
@@ -1762,6 +1792,8 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 		}
 		w.parent.emit(events.Windows.WindowKillFocus)
 	case w32.WM_ENTERSIZEMOVE:
+		// Set this before SetFocus: WM_SETFOCUS is dispatched re-entrantly.
+		w.imeMoveFocus.begin()
 		// This is needed to close open dropdowns when moving the window https://github.com/MicrosoftEdge/WebView2Feedback/issues/2290
 		w32.SetFocus(w.hwnd)
 		if int(w32.GetKeyState(w32.VK_LBUTTON))&(0x8000) != 0 {
@@ -1772,6 +1804,9 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 			w.parent.emit(events.Windows.WindowStartResize)
 		}
 	case w32.WM_EXITSIZEMOVE:
+		if w.imeMoveFocus.end() {
+			w.restoreIMEAfterMove()
+		}
 		if int(w32.GetKeyState(w32.VK_LBUTTON))&0x8000 != 0 {
 			w.parent.emit(events.Windows.WindowEndMove)
 		} else {
@@ -1781,9 +1816,12 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 		w.focus()
 		w.parent.emit(events.Windows.WindowSetFocus)
 	case wmRestoreWebViewFocusAfterActivate:
+		if !w.imeMoveFocus.acceptsTimer(wparam) {
+			return 0
+		}
 		if w.isActive() && w.chromium != nil && w.chromium.IsReady() {
 			w.focusingChromium = true
-			w.chromium.Focus()
+			w.focusChromiumForIME()
 			w.focusingChromium = false
 			_ = w.chromium.NotifyParentWindowPositionChanged()
 		}
