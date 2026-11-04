@@ -88,10 +88,12 @@ type windowsWebviewWindow struct {
 	contentProtectionApplied bool
 
 	focusingChromium bool
-	// focusHandoff records that focus was deliberately moved from the WebView
-	// to the host window by tabbing out of the page (#3783).
-	focusHandoff focusHandoff
-	onceDo       sync.Once
+	onceDo           sync.Once
+	imeMoveFocus     imeMoveFocusState
+	// Diagnostic-only message provenance, owned by the window thread.
+	imeMessage       uint32
+	imeParentMessage uint32
+	imeMessageDepth  uint
 
 	// Window move debouncer
 	moveDebouncer func(func())
@@ -1032,7 +1034,7 @@ func (w *windowsWebviewWindow) unminimise() {
 func (w *windowsWebviewWindow) maximise() {
 	w32.ShowWindow(w.hwnd, w32.SW_MAXIMIZE)
 	if w.chromium.GetController() != nil {
-		w.chromium.Focus()
+		w.focusChromiumForIME()
 	}
 }
 
@@ -1044,7 +1046,7 @@ func (w *windowsWebviewWindow) unmaximise() {
 func (w *windowsWebviewWindow) restore() {
 	w32.ShowWindow(w.hwnd, w32.SW_RESTORE)
 	if w.chromium.GetController() != nil {
-		w.chromium.Focus()
+		w.focusChromiumForIME()
 	}
 	w.enforceMinSizeConstraints()
 }
@@ -1114,7 +1116,7 @@ func (w *windowsWebviewWindow) fullscreen() {
 	w32.SetMenu(w.hwnd, 0)
 
 	if w.chromium.GetController() != nil {
-		w.chromium.Focus()
+		w.focusChromiumForIME()
 	}
 	w.parent.emit(events.Windows.WindowFullscreen)
 }
@@ -1177,7 +1179,57 @@ func (w *windowsWebviewWindow) isVisible() bool {
 	return style&w32.WS_VISIBLE != 0
 }
 
+// traceIME emits content-free markers for the temporary Toolbox diagnostic logger.
+func (w *windowsWebviewWindow) traceIME(phase string) {
+	globalApplication.Logger.Debug("toolbox.ime.focus", "phase", phase, "hwnd", uint64(w.hwnd), "window", uint64(w.parent.ID()), "moveActive", w.imeMoveFocus.moving, "moveEpoch", uint64(w.imeMoveFocus.epoch), "message", uint64(w.imeMessage), "parentMessage", uint64(w.imeParentMessage), "messageDepth", uint64(w.imeMessageDepth), "menuThemed", w.menubarTheme != nil)
+}
+
+// focusChromiumForIME covers all host-initiated Focus calls, including window
+// restore/maximise paths that can run inside a native move/size loop.
+func (w *windowsWebviewWindow) focusChromiumForIME() {
+	if w.imeMoveFocus.moving {
+		w.traceIME("controller-skip-moving")
+		return
+	}
+	if w.chromium == nil || !w.chromium.IsReady() {
+		w.traceIME("controller-skip-not-ready")
+		return
+	}
+	w.traceIME("controller-before")
+	w.chromium.Focus()
+	w.traceIME("controller-after")
+}
+
+func (w *windowsWebviewWindow) restoreIMEAfterMove() {
+	w.traceIME("move-exit")
+	if !w.isActive() || w.isDisabled() || w.isMinimised() {
+		w.traceIME("move-restore-skip-inactive")
+		return
+	}
+	if w.chromium == nil || !w.chromium.IsReady() {
+		w.traceIME("move-restore-skip-not-ready")
+		return
+	}
+	if err := w.chromium.NotifyParentWindowPositionChanged(); err != nil {
+		w.traceIME("move-position-notify-failed")
+	} else {
+		w.traceIME("move-position-notified")
+	}
+	w.traceIME("move-restore-before")
+	w.focusingChromium = true
+	defer func() { w.focusingChromium = false }()
+	w.focusChromiumForIME()
+	w.traceIME("move-restore-after")
+}
+
 func (w *windowsWebviewWindow) focus() {
+	w.traceIME("focus-enter")
+	defer w.traceIME("focus-leave")
+	if w.imeMoveFocus.moving {
+		w.traceIME("focus-skip-moving")
+		return
+	}
+	w.traceIME("foreground-request")
 	w32.SetForegroundWindow(w.hwnd)
 
 	if w.isDisabled() {
@@ -1196,37 +1248,8 @@ func (w *windowsWebviewWindow) focus() {
 	}
 
 	w.focusingChromium = true
-	w.chromium.Focus()
+	w.focusChromiumForIME()
 	w.focusingChromium = false
-}
-
-// restoreWebviewFocus moves focus back into the WebView when the window is
-// activated (Alt+Tab, taskbar, title bar click). Windows restores focus to the
-// WebView's child HWND on activation without the host receiving WM_SETFOCUS,
-// so the WebView controller is never told and the page stays unfocused.
-func (w *windowsWebviewWindow) restoreWebviewFocus() {
-	if !w.focusHandoff.shouldRestoreWebview() || w.isDisabled() || w.isMinimised() {
-		return
-	}
-	if w.chromium == nil || w.chromium.GetController() == nil {
-		return
-	}
-	w.focusingChromium = true
-	w.chromium.Focus()
-	w.focusingChromium = false
-}
-
-// moveFocusRequested handles the user tabbing out of the WebView. WebView2
-// would otherwise wrap focus inside the page, trapping the keyboard there
-// (#3783). Focus is handed to the native window; the next Tab re-enters.
-func (w *windowsWebviewWindow) moveFocusRequested(reason edge.COREWEBVIEW2_MOVE_FOCUS_REASON) bool {
-	next := reason == edge.COREWEBVIEW2_MOVE_FOCUS_REASON_NEXT
-	previous := reason == edge.COREWEBVIEW2_MOVE_FOCUS_REASON_PREVIOUS
-	if !w.focusHandoff.tabOut(next, previous) {
-		return false
-	}
-	w32.SetFocus(w.hwnd)
-	return true
 }
 
 // printStyle takes a windows style and prints it in a human-readable format
@@ -1706,9 +1729,22 @@ func (w *windowsWebviewWindow) isActive() bool {
 }
 
 func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintptr {
+	previousMessage, previousParent := w.imeMessage, w.imeParentMessage
+	w.imeParentMessage, w.imeMessage = previousMessage, msg
+	w.imeMessageDepth++
+	defer func() {
+		w.imeMessage, w.imeParentMessage = previousMessage, previousParent
+		w.imeMessageDepth--
+	}()
 
 	// Use the original implementation that works perfectly for maximized
+	if msg == w32.WM_ACTIVATE {
+		w.traceIME("activate-menubar-before")
+	}
 	processed, code := w32.MenuBarWndProc(w.hwnd, msg, wparam, lparam, w.menubarTheme)
+	if msg == w32.WM_ACTIVATE {
+		w.traceIME("activate-menubar-after")
+	}
 	if processed {
 		return code
 	}
@@ -1729,28 +1765,27 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 
 	switch msg {
 	case w32.WM_ACTIVATE:
+		w.traceIME("activate-enter")
+		defer w.traceIME("activate-leave")
 		if int(wparam&0xffff) == w32.WA_INACTIVE {
-			// Re-activating the window should return focus to the WebView.
-			w.focusHandoff.reset()
 			w.parent.emit(events.Windows.WindowInactive)
 		}
 		if int(wparam&0xffff) == w32.WA_ACTIVE {
 			getNativeApplication().currentWindowID = w.parent.id
-			w.restoreWebviewFocus()
 			w.parent.emit(events.Windows.WindowActive)
 		}
 		if int(wparam&0xffff) == w32.WA_CLICKACTIVE {
 			getNativeApplication().currentWindowID = w.parent.id
-			w.restoreWebviewFocus()
 			w.parent.emit(events.Windows.WindowClickActive)
 		}
 		if int(wparam&0xffff) != w32.WA_INACTIVE {
 			hwnd := w.hwnd
-			// The synchronous restore above preserves the normal activation path,
-			// while this delayed retry runs after WebView2 and TSF have observed the
-			// activated top-level window.
+			epoch := w.imeMoveFocus.epoch
+			// Preserve the beta.26-toolbox.1 IME path: WM_SETFOCUS restores keyboard
+			// focus, then re-enter the controller after WebView2 and TSF observe
+			// activation. Do not also move controller focus inside WM_ACTIVATE.
 			time.AfterFunc(100*time.Millisecond, func() {
-				w32.PostMessage(hwnd, wmRestoreWebViewFocusAfterActivate, 0, 0)
+				w32.PostMessage(hwnd, wmRestoreWebViewFocusAfterActivate, epoch, 0)
 			})
 		}
 		// If we want to have a frameless window but with the default frame decorations, extend the DWM client area.
@@ -1793,13 +1828,14 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 			return 1
 		}
 	case w32.WM_KILLFOCUS:
-		// The host no longer owns focus, including when the user clicks the page.
-		w.focusHandoff.reset()
 		if w.focusingChromium {
 			return 0
 		}
 		w.parent.emit(events.Windows.WindowKillFocus)
 	case w32.WM_ENTERSIZEMOVE:
+		// Set this before SetFocus: WM_SETFOCUS is dispatched re-entrantly.
+		w.imeMoveFocus.begin()
+		w.traceIME("move-enter")
 		// This is needed to close open dropdowns when moving the window https://github.com/MicrosoftEdge/WebView2Feedback/issues/2290
 		w32.SetFocus(w.hwnd)
 		if int(w32.GetKeyState(w32.VK_LBUTTON))&(0x8000) != 0 {
@@ -1810,19 +1846,34 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 			w.parent.emit(events.Windows.WindowStartResize)
 		}
 	case w32.WM_EXITSIZEMOVE:
+		if w.imeMoveFocus.end() {
+			w.restoreIMEAfterMove()
+		}
 		if int(w32.GetKeyState(w32.VK_LBUTTON))&0x8000 != 0 {
 			w.parent.emit(events.Windows.WindowEndMove)
 		} else {
 			w.parent.emit(events.Windows.WindowEndResize)
 		}
 	case w32.WM_SETFOCUS:
-		if w.focusHandoff.shouldRestoreWebview() {
-			w.focus()
-		}
+		w.traceIME("native-focus-enter")
+		w.focus()
+		w.traceIME("native-focus-leave")
 		w.parent.emit(events.Windows.WindowSetFocus)
 	case wmRestoreWebViewFocusAfterActivate:
+		w.traceIME("timer-enter")
+		defer w.traceIME("timer-leave")
+		if !w.imeMoveFocus.acceptsTimer(wparam) {
+			if w.imeMoveFocus.moving {
+				w.traceIME("timer-skip-moving")
+			} else {
+				w.traceIME("timer-skip-stale-move")
+			}
+			return 0
+		}
 		if w.isActive() && w.chromium != nil && w.chromium.IsReady() {
-			w.restoreWebviewFocus()
+			w.focusingChromium = true
+			w.focusChromiumForIME()
+			w.focusingChromium = false
 			_ = w.chromium.NotifyParentWindowPositionChanged()
 		}
 		return 0
@@ -1894,24 +1945,6 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 	case w32.WM_SYSKEYUP:
 		w.parent.emit(events.Windows.WindowKeyUp)
 	case w32.WM_KEYDOWN:
-		if wparam == w32.VK_TAB && w.chromium != nil && w.chromium.IsReady() {
-			// Focus is on the host window after tabbing out of the WebView;
-			// Tab / Shift+Tab re-enters it at the first / last element.
-			// Plain Tab re-entry takes precedence over user-defined Tab bindings;
-			// Ctrl+Tab remains available to shortcuts.
-			shift := int(w32.GetKeyState(w32.VK_SHIFT))&0x8000 != 0
-			ctrl := int(w32.GetKeyState(w32.VK_CONTROL))&0x8000 != 0
-			if previous, ok := w.focusHandoff.tabIn(shift, ctrl); ok {
-				var reason edge.COREWEBVIEW2_MOVE_FOCUS_REASON = edge.COREWEBVIEW2_MOVE_FOCUS_REASON_NEXT
-				if previous {
-					reason = edge.COREWEBVIEW2_MOVE_FOCUS_REASON_PREVIOUS
-				}
-				w.focusingChromium = true
-				w.chromium.MoveFocus(reason)
-				w.focusingChromium = false
-				return 0
-			}
-		}
 		w.parent.emit(events.Windows.WindowKeyDown)
 		w.processKeyBinding(uint(wparam))
 	case w32.WM_KEYUP:
@@ -2244,7 +2277,14 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 			}
 		}
 	}
-	return w32.DefWindowProc(w.hwnd, msg, wparam, lparam)
+	if msg == w32.WM_ACTIVATE {
+		w.traceIME("activate-default-before")
+	}
+	result := w32.DefWindowProc(w.hwnd, msg, wparam, lparam)
+	if msg == w32.WM_ACTIVATE {
+		w.traceIME("activate-default-after")
+	}
+	return result
 }
 
 // resyncWebviewRasterizationScale re-asserts the window's actual DPI on the
@@ -2605,7 +2645,8 @@ func (w *windowsWebviewWindow) setupChromium(recovering bool) (ready bool) {
 	chromium.NavigationStartingCallback = w.navigationStarting
 	chromium.NavigationCompletedCallback = w.navigationCompleted
 	chromium.AcceleratorKeyCallback = w.processKeyBinding
-	chromium.MoveFocusRequestedCallback = w.moveFocusRequested
+	// Leave MoveFocusRequested unhandled so Tab wraps inside the WebView,
+	// matching beta.26-toolbox.1 instead of transferring focus to the host HWND.
 	chromium.ProcessFailedCallback = w.processFailed
 
 	if recovering {
