@@ -38,7 +38,10 @@ var edgeMap = map[string]uintptr{
 	"nw-resize": w32.HTTOPLEFT,
 }
 
-const wmRestoreWebViewFocusAfterActivate = w32.WM_APP + 2049
+const (
+	wmRestoreWebViewFocusAfterActivate = w32.WM_APP + 2049
+	imeActivationFocusDelay            = 25 * time.Millisecond
+)
 
 type windowsWebviewWindow struct {
 	requestCancellation      *windowsRequestCancellation
@@ -90,6 +93,7 @@ type windowsWebviewWindow struct {
 	focusingChromium bool
 	onceDo           sync.Once
 	imeMoveFocus     imeMoveFocusState
+	imeActivation    imeActivationFocusState
 
 	// Window move debouncer
 	moveDebouncer func(func())
@@ -1740,10 +1744,10 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 		if int(wparam&0xffff) != w32.WA_INACTIVE {
 			hwnd := w.hwnd
 			epoch := w.imeMoveFocus.epoch
-			// Preserve the beta.26-toolbox.1 IME path: WM_SETFOCUS restores keyboard
-			// focus, then re-enter the controller after WebView2 and TSF observe
-			// activation. Do not also move controller focus inside WM_ACTIVATE.
-			time.AfterFunc(100*time.Millisecond, func() {
+			// DefWindowProc first places keyboard focus on the native host. Re-enter
+			// the controller only after WebView2 and TSF observe activation, avoiding
+			// an immediate and a delayed MoveFocus for the same activation.
+			time.AfterFunc(imeActivationFocusDelay, func() {
 				w32.PostMessage(hwnd, wmRestoreWebViewFocusAfterActivate, epoch, 0)
 			})
 		}
@@ -1813,7 +1817,13 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 			w.parent.emit(events.Windows.WindowEndResize)
 		}
 	case w32.WM_SETFOCUS:
-		w.focus()
+		// DefWindowProc(WM_ACTIVATE) synchronously focuses the host before it
+		// returns. Let the delayed activation recovery perform the only
+		// controller MoveFocus after WebView2 and TSF have observed activation.
+		// Other WM_SETFOCUS sources keep their immediate focus behaviour.
+		if !w.imeActivation.suppressImmediateControllerFocus() {
+			w.focus()
+		}
 		w.parent.emit(events.Windows.WindowSetFocus)
 	case wmRestoreWebViewFocusAfterActivate:
 		if !w.imeMoveFocus.acceptsTimer(wparam) {
@@ -2225,6 +2235,10 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 				return 0
 			}
 		}
+	}
+	if msg == w32.WM_ACTIVATE && int(wparam&0xffff) != w32.WA_INACTIVE {
+		w.imeActivation.beginDefaultActivation()
+		defer w.imeActivation.endDefaultActivation()
 	}
 	return w32.DefWindowProc(w.hwnd, msg, wparam, lparam)
 }
